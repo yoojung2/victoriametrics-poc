@@ -1,0 +1,21 @@
+*** Begin Patch: octocat-supply/api/src/index.ts ***
+# Step 2 — octocat-supply API에 Prometheus 계측을 붙이는 최소 변경(diff)
+# 적용 위치: octocat-supply 리포의 api/src/index.ts
+
+--- a/api/src/index.ts
++++ b/api/src/index.ts
+@@ import 구간
+ import { initializeDatabase } from './init-db';
+ import { errorHandler } from './utils/errors';
++import { metricsMiddleware, metricsHandler } from './metrics-middleware';
+
+@@ app.use(express.json()); 직후
+ app.use(express.json());
+
++// Prometheus 계측: 모든 라우트보다 먼저 등록해 요청 수/지연시간 수집
++app.use(metricsMiddleware);
++// Prometheus 스크레이프 엔드포인트
++app.get('/metrics', metricsHandler);
++
+ app.use('/api/deliveries', deliveryRoutes);
+*** End Patch ***

@@ -1,0 +1,22 @@
+# Step 2 — vmagent 설정 (파일 SD 방식, 바이너리 실행용)
+# octocat API(/metrics)를 스크레이프 → VM의 VictoriaMetrics로 remote_write
+#
+# 실행 예:
+#   ./vmagent-prod \
+#     -promscrape.config=step2/vmagent/scrape.yml \
+#     -remoteWrite.url=http://<VM_PUBIP>:8428/api/v1/write
+#
+global:
+  scrape_interval: 10s
+  external_labels:
+    env: poc
+    source: octocat-supply
+
+scrape_configs:
+  # octocat-supply API (prom-client 계측 후 /metrics 노출)
+  - job_name: octocat-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['localhost:3000']
+        labels:
+          app: octocat-api
