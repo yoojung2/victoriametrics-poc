@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octocat-api
+  namespace: vm
+  labels: { app: octocat-api }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: octocat-api }
+  template:
+    metadata:
+      labels: { app: octocat-api }
+      annotations:
+        # vmagent가 이 어노테이션 기반으로 스크레이프 (아래 vmagent scrape 설정과 매칭)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: api
+          # <ACR>.azurecr.io/octocat-api:metrics (az acr build로 푸시한 이미지)
+          image: REPLACE_WITH_ACR_LOGINSERVER/octocat-api:metrics
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet: { path: /metrics, port: 3000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: octocat-api
+  namespace: vm
+  labels: { app: octocat-api }
+spec:
+  selector: { app: octocat-api }
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

@@ -8,6 +8,7 @@ Azure 환경에서 **VictoriaMetrics**를 설치하고, 실제 애플리케이�
 |------|------|------|
 | **Step 1** | VictoriaMetrics 설치 (Azure VM 바이너리 + AKS Helm) | [docs/step1-install.md](docs/step1-install.md) |
 | **Step 2** | 앱 계측(prom-client)으로 실제 앱 메트릭 수집 → vmagent → 쿼리 | [docs/step2-app-metrics.md](docs/step2-app-metrics.md) |
+| **Step 3** | AKS에서 전체 파이프라인 재현 (앱 + vmagent + loadgen 24h 부하) | [docs/step3-aks-pipeline.md](docs/step3-aks-pipeline.md) |
 
 ## 아키텍처
 

@@ -1,0 +1,44 @@
+---
+# loadgen: 클러스터 안에서 octocat-api Service에 24시간 지속 부하
+# 세션과 무관하게 클러스터가 살아있는 한 계속 실행됨.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: vm
+  labels: { app: loadgen }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: loadgen }
+  template:
+    metadata:
+      labels: { app: loadgen }
+    spec:
+      containers:
+        - name: loadgen
+          image: curlimages/curl:8.11.0
+          env:
+            - name: BASE
+              value: "http://octocat-api.vm.svc.cluster.local:3000"
+            # 24시간(초). 종료 원하면 Deployment 삭제 또는 replicas=0
+            - name: DURATION
+              value: "86400"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo ">> loadgen 시작: $BASE (${DURATION}s)"
+              END=$(( $(date +%s) + DURATION ))
+              EPS="/api/products /api/branches /api/suppliers /api/orders /api/headquarters / /nonexistent"
+              req=0
+              while [ "$(date +%s)" -lt "$END" ]; do
+                for ep in $EPS; do
+                  curl -s -o /dev/null "${BASE}${ep}" || true
+                  req=$((req+1))
+                done
+                sleep 0.2
+              done
+              echo ">> 완료: 총 ${req} 요청"
+          resources:
+            requests: { cpu: "50m", memory: "32Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
