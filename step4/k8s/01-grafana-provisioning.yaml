@@ -1,0 +1,39 @@
+---
+# Grafana datasource provisioning — vmsingle을 Prometheus 타입으로 연결
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: vm
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        uid: victoriametrics
+        type: prometheus
+        access: proxy
+        # vmsingle은 Prometheus HTTP API 호환 → prometheus 타입으로 그대로 연결
+        url: http://vmsingle-victoria-metrics-single-server.vm.svc.cluster.local:8428
+        isDefault: true
+        jsonData:
+          timeInterval: 10s
+---
+# 대시보드 provider (파일 기반 자동 로드)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: vm
+data:
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: octocat
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards

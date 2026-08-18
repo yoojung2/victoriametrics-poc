@@ -9,6 +9,7 @@ Azure 환경에서 **VictoriaMetrics**를 설치하고, 실제 애플리케이�
 | **Step 1** | VictoriaMetrics 설치 (Azure VM 바이너리 + AKS Helm) | [docs/step1-install.md](docs/step1-install.md) |
 | **Step 2** | 앱 계측(prom-client)으로 실제 앱 메트릭 수집 → vmagent → 쿼리 | [docs/step2-app-metrics.md](docs/step2-app-metrics.md) |
 | **Step 3** | AKS에서 전체 파이프라인 재현 (앱 + vmagent + loadgen 24h 부하) | [docs/step3-aks-pipeline.md](docs/step3-aks-pipeline.md) |
+| **Step 4** | Grafana 대시보드 연동 (vmsingle datasource, RED 대시보드, 실측 검증) | [docs/step4-grafana.md](docs/step4-grafana.md) |
 | **쿼리 가이드** | VM·AKS 부하 기반 실전 운영 쿼리 (RED/USE, MetricsQL, 알람 예시) | [docs/query-guide.md](docs/query-guide.md) |
 | **카디널리티** | 카디널리티 개념·폭발 원인·진단 쿼리 (실측 기반) | [docs/cardinality.md](docs/cardinality.md) |
 | **확장/HA** | vmsingle vs vmcluster, scale-up/out·복제 판단 | [docs/scaling.md](docs/scaling.md) |
