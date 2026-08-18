@@ -1,6 +1,8 @@
-# VictoriaMetrics PoC — Azure VM(바이너리) & AKS(Helm) 설치 가이드
+# Step 1 — VictoriaMetrics 설치 (Azure VM 바이너리 & AKS Helm)
 
-Azure 환경에서 **VictoriaMetrics(single-node)** 를 두 가지 방식으로 설치·검증한 PoC 저장소입니다.
+> 📚 [← 전체 개요(README)](../README.md) · **Step 1: 설치** · [Step 2: 앱 메트릭 연동 →](step2-app-metrics.md)
+
+Azure 환경에서 **VictoriaMetrics(single-node)** 를 두 가지 방식으로 설치·검증합니다.
 
 | 방식 | 대상 | 설치 방법 |
 |------|------|-----------|
