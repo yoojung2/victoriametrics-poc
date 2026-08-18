@@ -1,26 +1,32 @@
-# Step 2: 샘플 앱 배포 & 메트릭 수집
+# Step 2: 샘플 앱(octocat-supply) 배포 & 메트릭 수집
 
-octocat-supply 앱을 VM에 배포하고, VictoriaMetrics로 메트릭을 수집하여 vmui에서 확인합니다.
+octocat-supply 앱을 VM에 배포하고, prom-client로 계측하여 VictoriaMetrics가 scrape → vmui에서 쿼리 확인하는 전체 과정입니다.
 
-## 전체 흐름
+## 전체 아키텍처
 
 ```
-octocat-supply (API :3000)
-       │
-       ├─ /metrics 엔드포인트 (prom-client)
-       │
-       ▼
-VictoriaMetrics (promscrape → :8428)
-       │
-       ▼
-vmui 대시보드에서 쿼리
+┌─────────────────────────────────────────────────────────┐
+│  Azure VM (vm-victoriametrics)                          │
+│                                                         │
+│  ┌────────────────────┐     ┌───────────────────────┐  │
+│  │ octocat-supply API │     │ VictoriaMetrics       │  │
+│  │ :3000              │     │ :8428                 │  │
+│  │                    │     │                       │  │
+│  │ GET /metrics ◀─────┼─────┤ promscrape (10s)     │  │
+│  │  (prom-client)     │     │                       │  │
+│  └────────────────────┘     └───────────────────────┘  │
+│                                       │                 │
+│                                       ▼                 │
+│                                 vmui 대시보드           │
+│                              http://<IP>:8428/vmui      │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 사전 조건
 
-- Step 1 완료 (VM에 VictoriaMetrics 구동 중)
+- Step 1 완료 (VM에 VictoriaMetrics가 `active (running)` 상태)
 - VM SSH 접속 가능
 
 ```bash
@@ -32,9 +38,19 @@ ssh azureuser@$VM_IP
 
 ## 2-1. Node.js & 빌드 도구 설치
 
+> ⚠️ `better-sqlite3` 네이티브 모듈 빌드를 위해 `build-essential`이 필요합니다.
+
 ```bash
+# Node.js 18.x
 curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
 sudo apt-get install -y nodejs make git
+
+# C/C++ 컴파일러 (네이티브 모듈 빌드용)
+sudo apt-get install -y build-essential python3
+
+# 확인
+node -v   # v18.x
+npm -v    # 10.x
 ```
 
 ---
@@ -48,77 +64,102 @@ cd octocat-supply
 make install
 ```
 
+> `make install`은 `api/`와 `frontend/` 각각 `npm install`을 실행합니다.
+> `better-sqlite3` 빌드 경고가 뜨지만, `build-essential`이 있으면 정상 완료됩니다.
+
 ---
 
-## 2-3. Prometheus 메트릭 엔드포인트 추가
+## 2-3. prom-client 설치 & 계측 코드 추가
 
-Express API에 `prom-client`를 추가하여 `/metrics` 엔드포인트를 노출합니다.
+### 패키지 설치
 
 ```bash
 cd ~/octocat-supply/api
 npm install prom-client
 ```
 
-`api/src/index.ts` (또는 메인 진입점)에 아래 코드 추가:
+### `api/src/index.ts` 수정
+
+파일 최상단에 import 추가:
 
 ```typescript
-import { collectDefaultMetrics, register, Counter, Histogram } from 'prom-client';
+import { collectDefaultMetrics, register, Counter, Histogram } from "prom-client";
+```
 
-// 기본 Node.js 메트릭 수집 (메모리, CPU, GC 등)
+`const app = express();` 바로 아래에 다음 코드 추가:
+
+```typescript
+// --- Prometheus Metrics ---
 collectDefaultMetrics();
 
-// HTTP 요청 카운터
 const httpRequestsTotal = new Counter({
-  name: 'http_requests_total',
-  help: 'Total HTTP requests',
-  labelNames: ['method', 'path', 'status'],
+  name: "http_requests_total",
+  help: "Total HTTP requests",
+  labelNames: ["method", "path", "status"],
 });
 
-// HTTP 요청 지연시간
 const httpRequestDuration = new Histogram({
-  name: 'http_request_duration_seconds',
-  help: 'HTTP request duration in seconds',
-  labelNames: ['method', 'path'],
+  name: "http_request_duration_seconds",
+  help: "HTTP request duration in seconds",
+  labelNames: ["method", "path"],
   buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 
-// 미들웨어로 등록
+// Metrics middleware
 app.use((req, res, next) => {
   const end = httpRequestDuration.startTimer({ method: req.method, path: req.path });
-  res.on('finish', () => {
-    httpRequestsTotal.inc({ method: req.method, path: req.path, status: res.statusCode });
+  res.on("finish", () => {
+    httpRequestsTotal.inc({ method: req.method, path: req.path, status: String(res.statusCode) });
     end();
   });
   next();
 });
 
-// /metrics 엔드포인트
-app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', register.contentType);
+// Metrics endpoint
+app.get("/metrics", async (_req, res) => {
+  res.set("Content-Type", register.contentType);
   res.end(await register.metrics());
 });
+// --- End Prometheus Metrics ---
 ```
+
+> 💡 미들웨어는 라우트 등록 전에 위치해야 모든 요청을 계측할 수 있습니다.
 
 ---
 
-## 2-4. 앱 실행
+## 2-4. 앱 실행 & /metrics 확인
 
 ```bash
-cd ~/octocat-supply
-make dev &
-
-# 동작 확인
-curl http://localhost:3000/api/products
-curl http://localhost:3000/metrics
+cd ~/octocat-supply/api
+npx tsx src/index.ts &
 ```
 
-`/metrics` 응답에 `http_requests_total`, `process_resident_memory_bytes` 등이 보이면 정상입니다.
+정상 시작 로그:
+```
+🚀 Initializing database...
+🎉 Database seeding completed successfully!
+✅ Database initialized successfully
+Server is running on port 3000
+```
+
+메트릭 엔드포인트 확인:
+```bash
+curl http://localhost:3000/metrics | head -20
+```
+
+예상 응답:
+```
+# HELP process_cpu_user_seconds_total Total user CPU time spent in seconds.
+# TYPE process_cpu_user_seconds_total counter
+process_cpu_user_seconds_total 0.224872
+...
+# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+```
 
 ---
 
-## 2-5. VictoriaMetrics scrape 설정
-
-VictoriaMetrics가 앱의 `/metrics`를 주기적으로 수집하도록 설정합니다.
+## 2-5. VictoriaMetrics promscrape 설정
 
 ```bash
 # scrape 설정 파일 생성
@@ -133,31 +174,42 @@ scrape_configs:
 EOF
 ```
 
-systemd 서비스에 promscrape 옵션 추가:
+systemd 서비스에 `-promscrape.config` 옵션 추가:
 
 ```bash
 sudo sed -i 's|ExecStart=.*|ExecStart=/usr/local/bin/victoria-metrics -storageDataPath=/var/lib/victoria-metrics-data -httpListenAddr=:8428 -retentionPeriod=30d -promscrape.config=/etc/victoriametrics/promscrape.yml|' /etc/systemd/system/victoriametrics.service
 
 sudo systemctl daemon-reload
 sudo systemctl restart victoriametrics
+```
 
-# scrape 대상 확인
+### scrape 상태 확인
+
+```bash
 curl http://localhost:8428/targets
 ```
 
-`/targets`에서 `octocat-supply` job이 `UP` 상태인지 확인합니다.
+예상 응답:
+```
+job=octocat-supply (1/1 up)
+  state=up, endpoint=http://localhost:3000/metrics,
+  labels={instance="localhost:3000",job="octocat-supply"},
+  scrapes_total=4, scrapes_failed=0, last_scrape=4.972s ago,
+  samples_scraped=119, error=
+```
+
+> `state=up`이면 정상 수집 중!
 
 ---
 
 ## 2-6. 트래픽 생성
 
 ```bash
-# 단발 부하
-for i in $(seq 1 200); do
+# 단발 부하 (50회 × 3 API = 150 요청)
+for i in $(seq 1 50); do
   curl -s http://localhost:3000/api/products > /dev/null
   curl -s http://localhost:3000/api/orders > /dev/null
   curl -s http://localhost:3000/api/branches > /dev/null
-  sleep 0.2
 done
 
 # 지속적 트래픽 (백그라운드, Ctrl+C로 중지)
@@ -165,35 +217,32 @@ while true; do
   curl -s http://localhost:3000/api/products > /dev/null
   curl -s http://localhost:3000/api/orders > /dev/null
   sleep 1
-done
+done &
 ```
 
 ---
 
 ## 2-7. vmui에서 쿼리 확인
 
-브라우저에서 `http://<VM_PUBLIC_IP>:8428/vmui` 접속 후 아래 쿼리를 실행합니다.
+브라우저: `http://<VM_PUBLIC_IP>:8428/vmui`
 
-### 기본 확인
+### 수집 확인
 
 ```promql
-# scrape 대상 상태
+# scrape target 상태 (1 = UP)
 up{job="octocat-supply"}
 
-# 수집된 메트릭 목록
+# 수집된 전체 메트릭 목록
 {job="octocat-supply"}
 ```
 
 ### HTTP 트래픽 분석
 
 ```promql
-# 총 요청 수
-http_requests_total{job="octocat-supply"}
-
 # 초당 요청 수 (RPS)
 rate(http_requests_total{job="octocat-supply"}[1m])
 
-# 경로별 요청 수
+# 경로별 RPS
 sum by (path) (rate(http_requests_total[1m]))
 
 # 상태코드별 분포
@@ -206,7 +255,7 @@ sum by (status) (http_requests_total)
 # 평균 응답 시간
 rate(http_request_duration_seconds_sum[1m]) / rate(http_request_duration_seconds_count[1m])
 
-# 95 퍼센타일 응답 시간
+# P95 응답 시간
 histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
 ```
 
@@ -225,9 +274,7 @@ nodejs_eventloop_lag_seconds
 
 ---
 
-## 2-8. (선택) NSG 포트 오픈
-
-외부에서 vmui 접근이 필요한 경우:
+## 2-8. (선택) NSG 포트 오픈 - 외부에서 vmui 접근
 
 ```bash
 az vm open-port \
@@ -237,22 +284,36 @@ az vm open-port \
   --priority 1010
 ```
 
-> ⚠️ 프로덕션에서는 특정 IP만 허용하세요.
+> ⚠️ 테스트 후 삭제하거나 특정 IP만 허용하세요.
 
 ---
 
-## 예상 결과
+## 실제 검증 결과
 
-트래픽 생성 후 vmui에서 아래와 같은 그래프를 확인할 수 있습니다:
+| 항목 | 결과 |
+|------|------|
+| 앱 실행 | ✅ port 3000 정상 기동 |
+| /metrics 응답 | ✅ Prometheus 포맷 출력 (119 samples) |
+| VictoriaMetrics scrape | ✅ `state=up`, `scrapes_failed=0` |
+| 수집된 메트릭 | ✅ `http_requests_total`, `http_request_duration_seconds`, `process_*`, `nodejs_*` 등 42종 |
+| vmui 쿼리 | ✅ `rate(http_requests_total[1m])` 등 정상 조회 |
 
-- `rate(http_requests_total[1m])` → 초당 요청 수 그래프
-- `histogram_quantile(0.95, ...)` → 응답 시간 추이
-- `process_resident_memory_bytes` → 메모리 사용량 변화
+---
+
+## 트러블슈팅
+
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| `make install` 실패 (better-sqlite3) | C 컴파일러 없음 | `sudo apt-get install -y build-essential` |
+| `/metrics` 404 | prom-client 코드 미적용 | 2-3 단계 코드 추가 확인 |
+| targets에서 `state=down` | 앱이 안 떠있음 | `npx tsx src/index.ts` 실행 확인 |
+| 쿼리 결과 비어있음 | scrape 직후 (데이터 미적재) | 10~15초 대기 후 재시도 |
 
 ---
 
 ## 참고
 
-- [VictoriaMetrics vmagent / scrape 문서](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-scrape-prometheus-exporters-such-as-node-exporter)
-- [prom-client (Node.js)](https://github.com/siimon/prom-client)
 - [octocat-supply 저장소](https://github.com/Azure-Samples/octocat-supply)
+- [prom-client (Node.js Prometheus client)](https://github.com/siimon/prom-client)
+- [VictoriaMetrics promscrape 설정](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-scrape-prometheus-exporters-such-as-node-exporter)
+- [vmui 사용법](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#vmui)
