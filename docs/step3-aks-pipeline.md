@@ -63,7 +63,7 @@ az aks update -g "$RG" -n "$AKS" --attach-acr "$ACR"
 az acr build -r "$ACR" -t octocat-api:metrics ./octocat-supply/api
 ```
 
-> ⚠️ **현재 진행 상태(정직 표기):** ACR `vmpocacr64419` **생성 완료**. `--attach-acr`(AcrPull)와 `az acr build`는 **아직 미실행** — 위 명령으로 이어서 진행하면 됩니다.
+> ✅ **실측 완료:** ACR `vmpocacr64419` 생성 → `--attach-acr`(AcrPull 부여) → `az acr build`로 이미지 빌드/푸시까지 모두 실행 검증됨. 이미지: `vmpocacr64419.azurecr.io/octocat-api:metrics` (digest `sha256:68a889…`).
 
 이미지 빌드 후, 매니페스트의 이미지 경로를 치환:
 ```bash
@@ -112,7 +112,7 @@ kubectl -n vm logs deploy/loadgen --tail=5
   kubectl -n vm delete -f step3/k8s/03-loadgen.yaml # 완전 제거
   ```
 
-## 5. 쿼리 검증 (vmsingle)
+## 5. 쿼리 검증 (vmsingle) — ✅ 실측 완료
 
 ```bash
 kubectl -n vm port-forward svc/vmsingle-victoria-metrics-single-server 8428:8428
@@ -123,6 +123,23 @@ vmui 쿼리 (Step 2와 동일, `env="poc-aks"` 라벨로 VM 데이터와 구분 
 ```promql
 sum by (status) (rate(http_requests_total{env="poc-aks"}[1m]))
 histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{env="poc-aks"}[5m])))
+```
+
+**실측 결과** (loadgen Deployment 가동 중, vmsingle에서 직접 조회):
+
+| 쿼리 | 결과 |
+|------|------|
+| `sum(rate(http_requests_total{env="poc-aks"}[1m]))` | **17.7 req/s** |
+| status=200 RPS | 15.2 req/s |
+| status=404 RPS | 2.5 req/s (`/nonexistent`) |
+| 시리즈 수 | 3 |
+
+배포 결과(namespace `vm`):
+```
+octocat-api  Deployment+Service   image: vmpocacr64419.azurecr.io/octocat-api:metrics, /metrics=200
+vmagent      Deployment+ConfigMap  static_configs: added targets: 1, remote_write→vmsingle
+loadgen      Deployment            DURATION=86400(24h) 실행 중 (세션 독립)
+vmsingle     (Step 1 Helm)         저장/쿼리
 ```
 
 ---

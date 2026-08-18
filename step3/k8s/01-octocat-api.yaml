@@ -20,7 +20,7 @@ spec:
       containers:
         - name: api
           # <ACR>.azurecr.io/octocat-api:metrics (az acr build로 푸시한 이미지)
-          image: REPLACE_WITH_ACR_LOGINSERVER/octocat-api:metrics
+          image: vmpocacr64419.azurecr.io/octocat-api:metrics
           ports:
             - containerPort: 3000
           readinessProbe:
