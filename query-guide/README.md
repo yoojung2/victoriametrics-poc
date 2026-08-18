@@ -674,6 +674,240 @@ nodejs_eventloop_lag_seconds        # ✅ 현재 lag
 
 ---
 
+## 9. 카디널리티 (Cardinality) - 모니터링 시스템의 숨은 킬러
+
+### 카디널리티란?
+
+**카디널리티 = 고유한 시계열(time series)의 총 개수**
+
+시계열이 뭔지부터 이해해야 합니다. 메트릭 이름 + 라벨 조합 하나가 시계열 하나입니다.
+
+```
+# 이 3개는 각각 다른 시계열 (총 3개)
+http_requests_total{method="GET",  path="/api/products", status="200"}
+http_requests_total{method="GET",  path="/api/orders",   status="200"}
+http_requests_total{method="POST", path="/api/orders",   status="201"}
+```
+
+라벨 값이 하나라도 다르면 **완전히 별개의 시계열**로 저장됩니다.
+시계열이 많아질수록 메모리, 디스크, 쿼리 시간이 전부 늘어납니다.
+
+### 카디널리티가 폭발하는 예시
+
+```
+❌ 위험한 라벨 설계
+
+# user_id를 라벨로 → 유저 100만 명이면 시계열 100만 개
+http_requests_total{user_id="user_12345", path="/api/products"}
+http_requests_total{user_id="user_12346", path="/api/products"}
+...
+http_requests_total{user_id="user_999999", path="/api/products"}
+
+# request_id를 라벨로 → 요청마다 새 시계열 생성 (무한 증가!)
+http_requests_total{request_id="abc-123-def"}
+http_requests_total{request_id="abc-124-def"}
+```
+
+```
+✅ 안전한 라벨 설계
+
+# 고유값이 적은 라벨만 사용
+http_requests_total{method="GET", path="/api/products", status="200"}
+
+# method: 4~5개 (GET, POST, PUT, DELETE, PATCH)
+# path: 라우트 패턴 10~20개
+# status: 5~10개 (200, 201, 400, 401, 404, 500...)
+# → 총 시계열 = 5 × 20 × 10 = 1,000개 (관리 가능)
+```
+
+### 카디널리티 폭발 공식
+
+```
+총 시계열 수 = 메트릭 수 × label_A 고유값 × label_B 고유값 × label_C 고유값 ...
+```
+
+예시:
+```
+라벨이 3개이고 각각 고유값이 10개면:
+  10 × 10 × 10 = 1,000 시계열 ← OK
+
+라벨이 5개이고 각각 고유값이 100개면:
+  100^5 = 10,000,000,000 시계열 ← 💀 시스템 사망
+```
+
+### 현재 PoC 환경의 카디널리티 확인
+
+아래 쿼리들은 실제 VM 환경에서 검증되었습니다.
+
+#### 전체 시계열 수 확인
+
+```promql
+count({__name__!=""})
+```
+
+검증 결과:
+```
+VM: 총 시계열 177개 (매우 건강한 수준 ✅)
+```
+
+#### 메트릭별 시계열 수 (어디서 시계열이 많이 생기나?)
+
+```promql
+topk(10, count by (__name__) ({__name__!=""}))
+```
+
+검증 결과:
+```
+http_request_duration_seconds_bucket: 63  ← histogram bucket이 가장 많음
+nodejs_gc_duration_seconds_bucket:    28  ← GC histogram
+http_requests_total:                  11
+http_request_duration_seconds_count:   9
+http_request_duration_seconds_sum:     9
+```
+
+> **핵심 발견:** `_bucket` 메트릭이 전체 시계열의 절반 이상을 차지합니다.
+> Histogram의 bucket이 많을수록 시계열이 급격히 늘어납니다.
+
+#### 라벨별 고유값 수 (어떤 라벨이 카디널리티를 키우나?)
+
+```bash
+# VictoriaMetrics API로 특정 라벨의 고유값 목록 조회
+curl -s http://localhost:8428/api/v1/label/path/values
+```
+
+검증 결과:
+```
+job:      1개 (octocat-supply)
+instance: 1개 (localhost:3000)
+path:    10개 (/api/products, /api/orders, /metrics ...)
+method:   2개 (GET, POST 등)
+status:   2개 (200, 404)
+kind:     4개 (minor, major, incremental, weakcb)
+```
+
+> 모든 라벨의 고유값이 10개 이하 → 건강한 카디널리티 ✅
+
+#### TSDB 상태 전체 조회 (가장 유용한 API)
+
+```bash
+curl -s http://localhost:8428/api/v1/status/tsdb | python3 -m json.tool
+```
+
+검증 결과:
+```
+총 시계열: 189
+총 label 쌍: 923
+
+시계열 많은 메트릭 TOP 3:
+  http_request_duration_seconds_bucket: 63
+  nodejs_gc_duration_seconds_bucket:    28
+  http_requests_total:                  11
+
+카디널리티 높은 label=value 쌍 TOP 3:
+  instance=localhost:3000: 189 (모든 시계열에 존재)
+  job=octocat-supply:      189 (모든 시계열에 존재)
+  method=GET:               82
+```
+
+### Histogram과 카디널리티의 관계
+
+Histogram이 왜 시계열을 많이 만드는지 이해하는 것이 중요합니다.
+
+```
+# prom-client의 기본 histogram bucket: 14개
+buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, +Inf]
+        + _sum, _count
+
+# 경로가 8개이면:
+14 buckets × 8 paths = 112 시계열 (bucket만으로!)
++ 8 (_sum) + 8 (_count) = 128 시계열
+
+# 경로가 100개가 되면:
+14 × 100 = 1,400 + 200 = 1,600 시계열 ← histogram 하나 때문에!
+```
+
+**대응 방법:**
+```javascript
+// ❌ bucket이 너무 많음
+new Histogram({
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2,
+            0.25, 0.3, 0.5, 0.75, 1, 2, 5, 10]
+  // 17개 bucket → 시계열 폭발
+});
+
+// ✅ 서비스에 맞는 bucket만 선택
+new Histogram({
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]
+  // 6개 bucket → 시계열 절약
+});
+```
+
+### 카디널리티 폭발 방지 체크리스트
+
+```
+✅ 라벨로 쓰면 안 되는 것:
+  - user_id, session_id, request_id, trace_id
+  - IP 주소, 이메일, 전화번호
+  - 타임스탬프, UUID
+  - 요청 본문(body)의 값
+  → 고유값이 무한히 늘어나는 값은 라벨이 아닌 로그에 기록
+
+✅ 라벨로 써도 되는 것:
+  - method (GET, POST, PUT, DELETE)
+  - status (200, 400, 404, 500)
+  - 라우트 패턴 (/api/products/:id, 실제 id값 아님)
+  - 환경 (dev, staging, production)
+  - 리전 (koreacentral, eastus)
+  → 고유값이 수십 개 이내인 것만 라벨로 사용
+```
+
+### Express 앱에서 흔한 실수: req.originalUrl vs 라우트 패턴
+
+```javascript
+// ❌ 카디널리티 폭발: 실제 URL을 라벨로 사용
+// /api/products/1, /api/products/2, ... /api/products/99999
+labels: { path: req.originalUrl }
+
+// ✅ 안전: 라우트 패턴을 라벨로 사용
+// /api/products/:id (고유값 1개)
+labels: { path: req.route?.path || req.originalUrl }
+```
+
+> 이 PoC에서는 `req.originalUrl`을 사용하고 있지만, 경로가 10개로 고정이라 괜찮습니다.
+> 프로덕션에서 동적 경로(`/users/:id`)가 있으면 반드시 라우트 패턴으로 정규화하세요.
+
+### 카디널리티 모니터링 쿼리 모음
+
+```promql
+# 1. 전체 활성 시계열 수
+count({__name__!=""})
+
+# 2. 메트릭별 시계열 수 (TOP 10)
+topk(10, count by (__name__) ({__name__!=""}))
+
+# 3. job별 시계열 수
+count by (job) ({__name__!=""})
+
+# 4. 시계열 증가 추세 (시간에 따라 올라가면 위험)
+count_over_time({__name__!=""}[1h])
+```
+
+### 카디널리티 기준치
+
+| 규모 | 활성 시계열 | 상태 |
+|------|-----------|------|
+| 소규모 (PoC, 개발) | ~1,000 | 🟢 여유 |
+| 중규모 (서비스 10개) | ~100,000 | 🟡 모니터링 필요 |
+| 대규모 (MSA 50+) | ~1,000,000 | 🟠 최적화 필요 |
+| 위험 | 10,000,000+ | 🔴 즉시 대응 |
+
+> **현재 PoC:** 189개 → 🟢 전혀 문제 없음
+>
+> VictoriaMetrics는 Prometheus 대비 높은 카디널리티에서도 성능이 좋지만,
+> 라벨 설계를 잘못하면 어떤 시스템이든 무너집니다.
+
+---
+
 ## 참고
 
 - [MetricsQL 공식 문서](https://docs.victoriametrics.com/metricsql/)
