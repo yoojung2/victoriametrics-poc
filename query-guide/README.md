@@ -240,70 +240,313 @@ VM:  Active Handles = 4, Open FDs = 39 (안정적)
 
 ## 5. MetricsQL 확장 기능 (Prometheus에서는 안 되는 것)
 
+### MetricsQL이란?
+
+VictoriaMetrics는 **MetricsQL**이라는 자체 쿼리 언어를 사용합니다.
+Prometheus의 PromQL과 **100% 호환**되면서, 추가 기능을 제공합니다.
+
+즉, 기존 PromQL 쿼리를 그대로 사용할 수 있고, 더 편리한 기능도 쓸 수 있습니다.
+
+```
+PromQL 쿼리 ──→ VictoriaMetrics에서 그대로 동작 ✅
+MetricsQL 쿼리 ──→ Prometheus에서는 에러 ❌
+```
+
+---
+
 ### 5-1. lookbehind window 자동 선택
 
+#### 개념 설명
+
+`rate()` 함수는 "최근 N분간의 초당 변화율"을 계산합니다.
+Prometheus에서는 이 "N분"(window)을 **반드시 직접 지정**해야 합니다.
+
 ```promql
-# Prometheus: 반드시 [5m] 같은 window 필요
-rate(http_requests_total{job="octocat-supply"}[5m])
-
-# VictoriaMetrics MetricsQL: window 생략 가능 (자동 최적 선택)
-rate(http_requests_total{job="octocat-supply"})
+# Prometheus: [5m]을 빼면 에러 발생
+rate(http_requests_total[5m])    # ✅ 동작
+rate(http_requests_total)         # ❌ 에러!
 ```
 
-검증 결과:
-```
-VM:  auto-window rate = 0.9333 req/s (수동 [5m]과 동일 결과 ✅)
+VictoriaMetrics는 window를 생략하면 **scrape_interval에 맞춰 자동으로 최적의 window를 선택**합니다.
+
+```promql
+# VictoriaMetrics MetricsQL: window 생략 가능
+rate(http_requests_total{job="octocat-supply"})         # ✅ 자동 선택
+rate(http_requests_total{job="octocat-supply"}[5m])     # ✅ 수동 지정도 가능
 ```
 
-> **장점:** scrape_interval 변경 시 쿼리 수정 불필요.
-> **주의:** Grafana 대시보드를 Prometheus로 마이그레이션할 때는 window 명시 필요.
+#### 검증 결과
+
+```
+수동 [5m]:     0.933333 req/s
+자동 (생략):   0.933333 req/s
+→ 동일한 결과 ✅
+```
+
+#### 왜 유용한가?
+
+- scrape_interval을 10s → 30s로 바꿔도 쿼리 수정이 필요 없음
+- 대시보드의 쿼리를 더 간결하게 작성 가능
+- **주의:** 나중에 Prometheus로 마이그레이션할 때는 window를 명시해야 함
+
+---
 
 ### 5-2. default 연산자 (빈 결과 처리)
 
-```promql
-# Prometheus: 데이터 없으면 그래프에 빈 구간
-rate(http_requests_total{path="/nonexistent"}[5m])
+#### 개념 설명
 
-# VictoriaMetrics: 없으면 0으로 채우기
-rate(http_requests_total{path="/nonexistent"}[5m]) default 0
+모니터링 대시보드에서 가장 흔한 문제 중 하나:
+"데이터가 없으면 그래프에 빈 구간이 생기거나, 계산이 NaN이 된다."
+
+Prometheus에서는 이걸 처리할 방법이 없지만,
+VictoriaMetrics는 `default` 연산자로 빈 결과에 기본값을 넣을 수 있습니다.
+
+#### 예시: 존재하지 않는 경로의 요청 수
+
+```promql
+# Prometheus: 데이터 없으면 → 결과 없음 (그래프 빈 칸)
+rate(http_requests_total{path="/없는경로"}[5m])
+
+# VictoriaMetrics: 데이터 없으면 → 0으로 채움
+rate(http_requests_total{path="/없는경로"}[5m]) default 0
+```
+
+#### 검증 결과
+
+```
+default 없이:  result count: 0 (빈 결과)
+default 0:     result count: 1, value: 0 (0으로 채워짐 ✅)
+```
+
+#### 실전 활용: 에러율 계산에서 NaN 방지
+
+```promql
+# 문제: 5xx 에러가 아예 없으면 분자가 0이 아니라 "없음"이 되어 NaN 발생
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/ sum(rate(http_requests_total[5m]))
+
+# 해결: default 0으로 분자가 없을 때 0을 반환
+sum(rate(http_requests_total{status=~"5.."}[5m])) default 0
+/ sum(rate(http_requests_total[5m]))
+```
+
+---
+
+### 5-3. keep_last_value (그래프 끊김 방지)
+
+#### 개념 설명
+
+앱을 재시작하거나, 네트워크 장애로 scrape가 일시 실패하면 어떻게 될까?
+
+- **Prometheus:** 5분 동안 데이터가 없으면 "stale" 마킹 → 그래프가 끊김
+- **VictoriaMetrics:** `keep_last_value()`로 마지막 수집 값을 유지할 수 있음
+
+```
+그래프 예시 (Prometheus):
+메모리 ████████████░░░░░░░████████████
+                    ↑ 앱 재시작 (빈 구간)
+
+그래프 예시 (VictoriaMetrics + keep_last_value):
+메모리 ████████████████████████████████
+                    ↑ 앱 재시작 (마지막 값 유지)
+```
+
+#### 쿼리
+
+```promql
+# 일반 쿼리: scrape 실패 시 그래프 끊김
+process_resident_memory_bytes{job="octocat-supply"}
+
+# keep_last_value: 마지막 값 유지 (연속 그래프)
+keep_last_value(process_resident_memory_bytes{job="octocat-supply"})
+```
+
+#### 검증 결과
+
+```
+VM: 96.8 MB (현재 값 유지 ✅)
+```
+
+#### 언제 쓰면 좋나?
+
+- 대시보드에서 그래프 끊김 없이 연속으로 보고 싶을 때
+- 배포/재시작이 잦은 서비스의 리소스 모니터링
+- **주의:** 앱이 실제로 죽었는데 마지막 값이 유지되면 오해할 수 있으므로,
+  알림 룰에서는 사용하지 않는 것이 좋음 (알림은 `up == 0`으로 별도 설정)
+
+---
+
+### 5-4. label 조작 함수 (쿼리 시점에서 라벨 변경)
+
+#### 개념 설명
+
+Prometheus에서 메트릭의 라벨(label)을 바꾸려면 scrape 설정 파일에서
+`relabel_configs`를 수정하고 서버를 재시작해야 합니다.
+
+VictoriaMetrics는 **쿼리 시점에서** 라벨을 추가/삭제/변경할 수 있습니다.
+
+#### label_set: 라벨 추가
+
+여러 환경(dev, staging, production)의 메트릭을 하나의 대시보드에서 볼 때 유용합니다.
+
+```promql
+# 환경 라벨과 팀 라벨을 쿼리 시점에 추가
+label_set(up{job="octocat-supply"}, "env", "production", "team", "backend")
 ```
 
 검증 결과:
 ```
-VM:  value = 0 (데이터 없는 경로도 0으로 표시 ✅)
+원래: {job="octocat-supply", instance="localhost:3000"}
+결과: {job="octocat-supply", instance="localhost:3000", env="production", team="backend"} ✅
 ```
 
-> **유용한 상황:** 대시보드에서 "No data" 대신 0을 보여주고 싶을 때.
-> 에러율 계산에서 분모가 0일 때 NaN 방지.
+#### label_del: 불필요한 라벨 제거
 
-### 5-3. keep_last_value (gap 채우기)
-
-```promql
-# 앱 재시작 등으로 scrape 실패 시 마지막 값 유지
-keep_last_value(process_resident_memory_bytes{job="octocat-supply"})
-```
-
-> Prometheus: 5분 후 stale 마킹 → 그래프 끊김
-> VictoriaMetrics: `keep_last_value()`로 연속 그래프 유지
-
-### 5-4. label 조작 함수
+`instance` 라벨이 있으면 같은 서비스의 여러 인스턴스가 별도 시리즈로 분리됩니다.
+집계할 때 방해가 되는 라벨을 제거할 수 있습니다.
 
 ```promql
-# 환경 라벨 추가
-label_set(up{job="octocat-supply"}, "env", "poc")
-
-# 불필요한 instance 라벨 제거
+# instance 라벨 제거 → 모든 인스턴스를 하나로 합침
 label_del(http_requests_total{job="octocat-supply"}, "instance")
 ```
 
-> Prometheus에서는 relabeling 설정 파일에서만 가능했던 것을 쿼리 시점에서 처리.
+검증 결과:
+```
+원래: {job, instance, method, path, status}
+결과: {job, method, path, status}  ← instance 제거됨 ✅
+```
 
-### 5-5. range_last / range_first
+#### Prometheus에서는?
+
+```yaml
+# Prometheus: 설정 파일에서만 가능 (서버 재시작 필요)
+metric_relabel_configs:
+  - action: labeldrop
+    regex: instance
+```
+
+→ VictoriaMetrics는 쿼리 한 줄로 즉시 처리 가능
+
+---
+
+### 5-5. range_last / range_first (구간의 처음/끝 값)
+
+#### 개념 설명
+
+"최근 5분간의 마지막 값" 또는 "최근 5분간의 첫 번째 값"을 가져옵니다.
+Prometheus에는 이 함수가 없어서, subquery 등 복잡한 우회가 필요합니다.
 
 ```promql
-# 5분간의 마지막 값
-range_last(http_requests_total{job="octocat-supply"}[5m])
+# 최근 5분간의 마지막으로 수집된 값
+range_last(http_requests_total{job="octocat-supply", path="/api/products"}[5m])
+
+# 최근 5분간의 첫 번째로 수집된 값
+range_first(http_requests_total{job="octocat-supply", path="/api/products"}[5m])
 ```
+
+검증 결과:
+```
+VM: range_last = 1478 (현재 누적 요청 수 ✅)
+```
+
+#### 언제 쓰나?
+
+- 배포 직전/직후의 메트릭 스냅샷 비교
+- 특정 시점의 정확한 값이 필요할 때 (평균이 아닌 실제 값)
+
+---
+
+### 5-6. median (중간값)
+
+#### 개념 설명
+
+Prometheus에서 중간값을 구하려면 `quantile(0.5, ...)` 을 써야 합니다.
+VictoriaMetrics는 `median()` 함수를 직접 제공합니다.
+
+```promql
+# Prometheus 방식
+quantile(0.5, http_request_duration_seconds_count{job="octocat-supply"})
+
+# VictoriaMetrics MetricsQL
+median(http_request_duration_seconds_count{job="octocat-supply"})
+```
+
+검증 결과:
+```
+VM: median = 1477 ✅
+```
+
+---
+
+### 5-7. count_ne_over_time (특정 값이 아닌 횟수 세기)
+
+#### 개념 설명
+
+"최근 1시간 동안 서비스가 다운된 적이 있나?"를 한 줄로 확인할 수 있습니다.
+`up` 메트릭은 정상이면 1, 다운이면 0입니다.
+`count_ne_over_time(up[1h], 1)`은 "1이 아니었던 횟수"를 세줍니다.
+
+```promql
+# 최근 1시간 중 up이 1이 아니었던(= 다운이었던) 횟수
+count_ne_over_time(up{job="octocat-supply"}[1h], 1)
+```
+
+검증 결과:
+```
+VM: 다운타임 횟수: 0 (1시간 내 다운 없음 ✅)
+```
+
+#### Prometheus에서는?
+
+이 함수가 없어서 다음과 같이 우회해야 합니다:
+```promql
+# Prometheus: 복잡한 우회 필요
+count_over_time((up{job="octocat-supply"} != 1)[1h:])
+```
+
+---
+
+### 5-8. running_sum (누적 합계)
+
+#### 개념 설명
+
+시간이 지남에 따라 값이 어떻게 누적되는지 보여줍니다.
+"오늘 하루 동안 총 몇 건의 요청이 들어왔나?"를 시각적으로 볼 때 유용합니다.
+
+```promql
+# 1분 단위 요청 증가량의 누적 합계
+running_sum(increase(http_requests_total{job="octocat-supply", path="/api/products"}[1m]))
+```
+
+검증 결과:
+```
+VM: 누적합 = 56 ✅
+```
+
+#### Grafana 대시보드에서의 활용
+
+- 일일 총 요청 수 누적 그래프
+- 배포 후 누적 에러 수 추적
+- Prometheus에서는 별도의 recording rule이 필요한 작업을 쿼리 한 줄로 처리
+
+---
+
+### 5번 전체 요약: Prometheus vs MetricsQL 비교표
+
+| 기능 | Prometheus (PromQL) | VictoriaMetrics (MetricsQL) |
+|------|--------------------|--------------------------|
+| window 생략 | ❌ `rate(x)` → 에러 | ✅ `rate(x)` → 자동 선택 |
+| 빈 결과 기본값 | ❌ 없음 (NaN 발생) | ✅ `rate(x[5m]) default 0` |
+| 그래프 끊김 방지 | ❌ 5분 후 stale | ✅ `keep_last_value(x)` |
+| 쿼리 시 라벨 추가 | ❌ 설정 파일만 가능 | ✅ `label_set(x, "k", "v")` |
+| 쿼리 시 라벨 삭제 | ❌ 설정 파일만 가능 | ✅ `label_del(x, "instance")` |
+| 구간 처음/끝 값 | ❌ 없음 | ✅ `range_first(x[5m])`, `range_last(x[5m])` |
+| 중간값 | ⚠️ `quantile(0.5, x)` | ✅ `median(x)` |
+| 특정 값 아닌 횟수 | ❌ 복잡한 우회 필요 | ✅ `count_ne_over_time(x[1h], 1)` |
+| 누적 합계 | ❌ recording rule 필요 | ✅ `running_sum(increase(x[1m]))` |
+
+> **핵심:** 기존 PromQL 쿼리는 그대로 쓰면서, 더 편리한 MetricsQL 기능을 점진적으로 도입할 수 있습니다.
+> Prometheus → VictoriaMetrics 마이그레이션 시 기존 쿼리 수정은 불필요합니다.
 
 ---
 
