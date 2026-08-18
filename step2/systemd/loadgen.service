@@ -1,0 +1,14 @@
+[Unit]
+Description=octocat-api load generator (continuous)
+After=network.target octocat-api.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/loadgen-loop.sh
+Environment=BASE=http://localhost:3000
+Restart=always
+RestartSec=2
+User=azureuser
+
+[Install]
+WantedBy=multi-user.target

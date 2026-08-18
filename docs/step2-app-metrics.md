@@ -223,6 +223,87 @@ VictoriaMetrics는 **MetricsQL**을 씁니다. PromQL의 상위 호환이라 기
 
 ---
 
+## 8. VM에서 24시간 상시화 — systemd 서비스 구성 (✅ 실측 완료)
+
+2~5절은 로컬 세션(터미널)에 묶여 실행돼서 **세션이 닫히면 종료**됩니다.
+실제 서비스처럼 **재부팅·세션 종료와 무관하게 계속** 돌리려면 Azure VM 자체에 systemd 서비스로 올립니다.
+아래는 VM(`52.141.7.189`)에 실제로 구성한 내용입니다.
+
+### 8-1. 구성 요소 (3개 서비스 + VictoriaMetrics)
+
+```
+[loadgen.service] ──HTTP 무한루프──▶ [octocat-api.service :3000] ──/metrics──▶
+   [vmagent.service] ──remote_write──▶ [victoriametrics.service :8428]  ◀── 쿼리
+```
+
+| 서비스 | 파일 | 역할 |
+|--------|------|------|
+| `octocat-api` | [step2/systemd/octocat-api.service](../step2/systemd/octocat-api.service) | 계측 앱(node dist/index.js), `/metrics` 노출 |
+| `vmagent` | [step2/systemd/vmagent.service](../step2/systemd/vmagent.service) | scrape → 로컬 `:8428` remote_write |
+| `loadgen` | [step2/systemd/loadgen.service](../step2/systemd/loadgen.service) + [loadgen-loop.sh](../step2/systemd/loadgen-loop.sh) | 무한 부하 루프 (`Restart=always`) |
+| `victoriametrics` | (Step 1) | 저장/쿼리 |
+
+### 8-2. 사전 준비 (VM에 Node + 앱 + vmagent)
+
+```bash
+# Node 20 설치
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# 계측된 api 소스 배치 후 빌드
+sudo mkdir -p /opt/octocat && sudo tar xzf octocat-api.tgz -C /opt/octocat
+cd /opt/octocat/api && npm install --omit=dev && npm install prom-client && npx tsc
+
+# vmagent 바이너리 배치 (Step 1의 vmutils 번들에 포함)
+sudo mv vmagent-prod /usr/local/bin/vmagent && sudo chmod +x /usr/local/bin/vmagent
+```
+
+### 8-3. 설정/스크립트 배치 + 서비스 등록
+
+```bash
+sudo mkdir -p /etc/vmagent /var/lib/vmagent
+sudo cp scrape.yml /etc/vmagent/scrape.yml
+sudo cp loadgen-loop.sh /usr/local/bin/ && sudo chmod 755 /usr/local/bin/loadgen-loop.sh
+sudo chown azureuser:azureuser /var/lib/vmagent
+
+sudo cp octocat-api.service vmagent.service loadgen.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now octocat-api vmagent loadgen
+```
+
+### 8-4. 검증 (실측)
+
+```bash
+$ systemctl is-active octocat-api vmagent loadgen victoriametrics
+active / active / active / active
+
+# 순수 systemd 부하 상태 (로컬 프로세스 모두 종료 후)
+$ curl -s "http://<VM_PUBIP>:8428/api/v1/query" \
+    --data-urlencode 'query=sum by (status)(rate(http_requests_total{env="poc"}[1m]))'
+# status=200 → 475 req/s,  status=404 → 68 req/s
+```
+
+3개 서비스 모두 `enabled` → **재부팅 후 자동 시작**. 세션과 무관하게 24시간+ 유지됩니다.
+
+### 8-5. ⚠️ 구성 중 실제로 겪은 함정 (기록)
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| `vmagent` `activating`만 반복, `status=255` | `sudo cp`한 `scrape.yml`이 root 소유(600) → azureuser 실행 시 **permission denied** | `sudo chmod 644 /etc/vmagent/scrape.yml`, 디렉터리 `755` |
+| `loadgen` `status=126 Permission denied` | `sudo cp`가 `chmod +x`를 덮어써 실행권한 상실 | `sudo chmod 755 /usr/local/bin/loadgen-loop.sh` |
+| RPS가 비정상적으로 높음(중복) | 세션 로컬 loadgen과 systemd loadgen이 **동시 실행** | 로컬 프로세스 종료 후 systemd만 유지 |
+
+### 8-6. 운영 명령
+
+```bash
+sudo systemctl status loadgen           # 상태 확인
+sudo journalctl -u vmagent -f           # 로그 추적
+sudo systemctl stop loadgen             # 부하 일시정지
+sudo systemctl disable --now loadgen    # 부하 완전 중지 + 자동시작 해제
+```
+
+---
+
 ## 트러블슈팅
 
 | 증상 | 원인/해결 |
@@ -241,8 +322,14 @@ step2/
 ├── app/
 │   ├── metrics-middleware.ts   # prom-client 계측 미들웨어 (api/src/에 복사)
 │   └── index.ts.patch          # index.ts 연결 diff (3곳 변경)
-└── vmagent/
-    └── scrape.yml              # vmagent 스크레이프 설정
+├── vmagent/
+│   └── scrape.yml              # vmagent 스크레이프 설정
+└── systemd/                    # VM 24시간 상시화 (8절)
+    ├── octocat-api.service     # 앱 서비스
+    ├── vmagent.service         # vmagent 서비스
+    ├── loadgen.service         # 부하 서비스
+    ├── loadgen-loop.sh         # 무한 부하 루프
+    └── scrape.yml              # /etc/vmagent/scrape.yml 원본
 scripts/
-└── loadgen.sh                  # 트래픽 생성기
+└── loadgen.sh                  # 트래픽 생성기 (일회성)
 ```

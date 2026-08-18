@@ -1,0 +1,16 @@
+[Unit]
+Description=vmagent (scrape octocat-api -> remote_write to local VictoriaMetrics)
+After=network.target victoriametrics.service octocat-api.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vmagent \
+    -promscrape.config=/etc/vmagent/scrape.yml \
+    -remoteWrite.url=http://localhost:8428/api/v1/write \
+    -remoteWrite.tmpDataPath=/var/lib/vmagent
+Restart=on-failure
+RestartSec=5
+User=azureuser
+
+[Install]
+WantedBy=multi-user.target

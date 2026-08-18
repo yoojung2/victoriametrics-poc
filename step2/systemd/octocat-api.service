@@ -1,0 +1,16 @@
+[Unit]
+Description=octocat-supply API (prom-client 계측)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/octocat/api
+ExecStart=/usr/bin/node dist/index.js
+Environment=PORT=3000
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=5
+User=azureuser
+
+[Install]
+WantedBy=multi-user.target
