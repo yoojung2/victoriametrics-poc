@@ -160,7 +160,92 @@ process_cpu_user_seconds_total 0.224872
 
 ---
 
-## 2-5. VictoriaMetrics promscrape 설정
+## 2-5. VictoriaMetrics systemd 서비스 구성
+
+Step 1에서 등록한 systemd 서비스에 promscrape 옵션을 추가합니다.
+
+### 현재 서비스 파일 확인
+
+```bash
+sudo cat /etc/systemd/system/victoriametrics.service
+```
+
+### 서비스 파일 전체 내용
+
+```ini
+[Unit]
+Description=VictoriaMetrics
+After=network.target
+
+[Service]
+User=victoriametrics
+ExecStart=/usr/local/bin/victoria-metrics \
+  -storageDataPath=/var/lib/victoria-metrics-data \
+  -httpListenAddr=:8428 \
+  -retentionPeriod=30d \
+  -promscrape.config=/etc/victoriametrics/promscrape.yml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 주요 옵션 설명
+
+| 옵션 | 설명 |
+|------|------|
+| `-storageDataPath` | 메트릭 데이터 저장 경로 |
+| `-httpListenAddr=:8428` | API/vmui 리스닝 포트 |
+| `-retentionPeriod=30d` | 데이터 보관 기간 (30일) |
+| `-promscrape.config` | Prometheus scrape 설정 파일 경로 |
+| `Restart=always` | 프로세스 비정상 종료 시 자동 재시작 |
+| `User=victoriametrics` | 전용 서비스 계정으로 실행 (보안) |
+
+### Step 1 → Step 2에서 변경된 점
+
+Step 1에서는 promscrape 없이 기본 설치만 했습니다:
+
+```ini
+# Step 1 (초기)
+ExecStart=/usr/local/bin/victoria-metrics \
+  -storageDataPath=/var/lib/victoria-metrics-data \
+  -httpListenAddr=:8428 \
+  -retentionPeriod=30d
+```
+
+Step 2에서 앱 메트릭을 수집하기 위해 `-promscrape.config` 옵션을 추가했습니다:
+
+```bash
+# ExecStart 라인에 promscrape 옵션 추가
+sudo sed -i 's|ExecStart=.*|ExecStart=/usr/local/bin/victoria-metrics -storageDataPath=/var/lib/victoria-metrics-data -httpListenAddr=:8428 -retentionPeriod=30d -promscrape.config=/etc/victoriametrics/promscrape.yml|' /etc/systemd/system/victoriametrics.service
+
+# 변경사항 반영 & 재시작
+sudo systemctl daemon-reload
+sudo systemctl restart victoriametrics
+
+# 상태 확인
+sudo systemctl status victoriametrics
+```
+
+### 서비스 관리 명령어
+
+```bash
+# 상태 확인
+sudo systemctl status victoriametrics
+
+# 로그 확인 (실시간)
+sudo journalctl -u victoriametrics -f
+
+# 재시작
+sudo systemctl restart victoriametrics
+
+# 부팅 시 자동 시작 확인
+sudo systemctl is-enabled victoriametrics
+```
+
+---
+
+## 2-6. promscrape 설정 파일
 
 ```bash
 # scrape 설정 파일 생성
@@ -203,7 +288,7 @@ job=octocat-supply (1/1 up)
 
 ---
 
-## 2-6. 트래픽 생성
+## 2-7. 트래픽 생성
 
 ```bash
 # 단발 부하 (50회 × 3 API = 150 요청)
@@ -223,7 +308,7 @@ done &
 
 ---
 
-## 2-7. vmui에서 쿼리 확인
+## 2-8. vmui에서 쿼리 확인
 
 브라우저: `http://<VM_PUBLIC_IP>:8428/vmui`
 
@@ -275,7 +360,7 @@ nodejs_eventloop_lag_seconds
 
 ---
 
-## 2-8. (선택) NSG 포트 오픈 - 외부에서 vmui 접근
+## 2-9. (선택) NSG 포트 오픈 - 외부에서 vmui 접근
 
 ```bash
 az vm open-port \
