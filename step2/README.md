@@ -106,10 +106,11 @@ const httpRequestDuration = new Histogram({
 });
 
 // Metrics middleware
+// ⚠️ req.path가 아닌 req.originalUrl을 사용해야 /api/products 등 전체 경로가 캡처됩니다
 app.use((req, res, next) => {
-  const end = httpRequestDuration.startTimer({ method: req.method, path: req.path });
+  const end = httpRequestDuration.startTimer({ method: req.method, path: req.originalUrl });
   res.on("finish", () => {
-    httpRequestsTotal.inc({ method: req.method, path: req.path, status: String(res.statusCode) });
+    httpRequestsTotal.inc({ method: req.method, path: req.originalUrl, status: String(res.statusCode) });
     end();
   });
   next();
@@ -308,6 +309,81 @@ az vm open-port \
 | `/metrics` 404 | prom-client 코드 미적용 | 2-3 단계 코드 추가 확인 |
 | targets에서 `state=down` | 앱이 안 떠있음 | `npx tsx src/index.ts` 실행 확인 |
 | 쿼리 결과 비어있음 | scrape 직후 (데이터 미적재) | 10~15초 대기 후 재시도 |
+| path가 `/`, `/1` 등 상대경로만 나옴 | `req.path` 사용 | `req.originalUrl`로 변경 (라우터 마운트 포인트 포함) |
+| vmui에 접속 안 됨 | NSG 8428 미오픈 | `az vm open-port --port 8428` 실행 |
+
+---
+
+## VictoriaMetrics 쿼리 시 중요한 점
+
+### 1. MetricsQL vs PromQL
+
+VictoriaMetrics는 **MetricsQL**을 사용합니다. PromQL과 호환되면서 확장된 기능을 제공합니다.
+
+#### PromQL과 동일하게 동작하는 것
+```promql
+rate(http_requests_total[1m])
+histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+sum by (path) (rate(http_requests_total[1m]))
+```
+
+#### MetricsQL 확장 기능 (Prometheus에서는 동작 안 함)
+```promql
+# lookbehind window 자동 선택 (Prometheus는 에러)
+rate(http_requests_total)
+
+# keep_last_value: 데이터 gap이 있어도 마지막 값 유지
+keep_last_value(process_resident_memory_bytes)
+
+# default: 결과 없을 때 기본값
+rate(http_requests_total[1m]) default 0
+
+# label 조작 함수
+label_set(up, "env", "poc")
+label_del(http_requests_total, "instance")
+
+# range_first / range_last
+range_last(http_requests_total[5m])
+```
+
+### 2. Prometheus와의 주요 차이점
+
+| 항목 | Prometheus | VictoriaMetrics |
+|------|-----------|----------------|
+| **쿼리 언어** | PromQL | MetricsQL (PromQL 상위호환) |
+| **lookbehind window** | 필수 (`rate(x[5m])`) | 생략 가능 (`rate(x)` → 자동 선택) |
+| **stale 처리** | 5분 후 stale 마킹 | `keep_last_value()`로 유지 가능 |
+| **subquery** | 지원 | 지원 + 자동 최적화 |
+| **스토리지** | 로컬 TSDB (2시간 블록) | 자체 스토리지 (더 높은 압축률) |
+| **장기 보관** | Thanos/Cortex 필요 | 단일 바이너리로 수년 보관 가능 |
+| **수평 확장** | Federation/Thanos | VictoriaMetrics Cluster 모드 |
+| **리소스 사용** | 메모리 많이 사용 | 동일 데이터 대비 3~7배 적은 디스크/RAM |
+| **scrape** | 내장 | 내장 (`-promscrape.config`) 또는 vmagent 분리 |
+| **다운샘플링** | 없음 (Thanos에서 가능) | 내장 downsampling |
+| **Grafana 연동** | Prometheus datasource | Prometheus datasource 그대로 사용 가능 |
+| **API 호환** | 기준 | `/api/v1/*` 100% 호환 |
+
+### 3. 쿼리 작성 시 주의사항
+
+**rate() 사용 시:**
+- counter 타입 메트릭에만 사용 (`http_requests_total`)
+- VictoriaMetrics는 rate 결과가 Prometheus보다 정확할 수 있음 (extrapolation 방식 차이)
+
+**label cardinality 주의:**
+```promql
+# ❌ 나쁜 예: path에 /api/products/1, /api/products/2... 무한 증가
+http_requests_total{path=~"/api/products/.*"}
+
+# ✅ 좋은 예: 정규화된 path 사용 또는 집계
+sum by (method) (rate(http_requests_total[1m]))
+```
+
+**시간 범위 선택:**
+```promql
+# scrape_interval이 10s면 최소 2~4배 (20~40s) 이상의 range 사용
+rate(http_requests_total[1m])   # ✅ 좋음
+rate(http_requests_total[10s])  # ❌ 데이터 포인트 부족 가능
+```
 
 ---
 
@@ -317,3 +393,5 @@ az vm open-port \
 - [prom-client (Node.js Prometheus client)](https://github.com/siimon/prom-client)
 - [VictoriaMetrics promscrape 설정](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#how-to-scrape-prometheus-exporters-such-as-node-exporter)
 - [vmui 사용법](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#vmui)
+- [MetricsQL 문서](https://docs.victoriametrics.com/metricsql/)
+- [MetricsQL vs PromQL 비교](https://docs.victoriametrics.com/metricsql/#metricsql-features)
