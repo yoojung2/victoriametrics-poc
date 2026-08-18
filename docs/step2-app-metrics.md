@@ -134,22 +134,92 @@ scrape_configs:
 
 ---
 
-## 5. VictoriaMetrics(vmui)에서 쿼리 확인
+## 5. VictoriaMetrics(vmui)에서 쿼리 확인 — ✅ 실측 검증 완료
 
-`http://<VM_PUBIP>:8428/vmui` 접속 후 아래 쿼리:
+`http://<VM_PUBIP>:8428/vmui` 접속 후 아래 쿼리를 실행합니다.
+아래 수치는 `loadgen.sh`로 **805개 요청(7개 엔드포인트, 30초)** 을 발생시킨 뒤 실제로 조회한 결과입니다.
 
-| 쿼리 | 의미 |
-|------|------|
-| `http_requests_total` | 라벨별 누적 요청 수 |
-| `rate(http_requests_total[1m])` | 초당 요청률(RPS) |
-| `sum by (status) (rate(http_requests_total[1m]))` | 상태코드별 RPS (2xx/4xx) |
-| `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))` | p95 응답시간 |
-| `process_resident_memory_bytes{app="octocat-api"}` | 앱 메모리 사용량 |
+| 쿼리 | 의미 | 실측 결과 |
+|------|------|-----------|
+| `http_requests_total` | 라벨별 누적 요청 수 | 3 시리즈 (`/`=357, `/metrics`=13, `/nonexistent`=59) |
+| `sum(rate(http_requests_total[1m]))` | 전체 초당 요청률(RPS) | **27.36 req/s** |
+| `sum by (status) (rate(http_requests_total[1m]))` | 상태코드별 RPS | 200 → 23.48 / 404 → 3.88 |
+| `histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))` | p95 응답시간 | **4.75 ms** |
+| `process_resident_memory_bytes{app="octocat-api"}` | 앱 메모리(RSS) | 112.7 MB |
 
-CLI로도 확인 가능:
+> 저장된 메트릭 종류: **48개** (`http_*`, `nodejs_*`, `process_*`)
+
+CLI 검증 예 (실제 사용):
 ```bash
-curl -s "http://<VM_PUBIP>:8428/api/v1/query?query=http_requests_total" | jq .
+# URL 인코딩 이슈 피하려면 --data-urlencode 사용 권장
+curl -s "http://<VM_PUBIP>:8428/api/v1/query" \
+  --data-urlencode 'query=sum by (status) (rate(http_requests_total[1m]))' | jq .
 ```
+
+---
+
+## 6. 쿼리 시 중요한 점 (MetricsQL 실전 노트)
+
+실측하며 확인한, 데이터를 "제대로" 보기 위한 핵심 포인트입니다.
+
+### 6-1. Counter는 raw 값이 아니라 `rate()`로 본다
+`http_requests_total`은 **단조 증가 카운터**입니다. raw 값(357, 59…)은 "시작 이후 누적"이라 그래프로는 의미가 약합니다.
+초당 처리량은 반드시 `rate()`(구간 증가분/초)로 봅니다.
+```promql
+sum(rate(http_requests_total[1m]))          # 전체 RPS
+sum by (route,status) (rate(...[1m]))        # 라벨별 분해
+```
+
+### 6-2. `[1m]` 같은 구간(range)은 scrape_interval의 4배 이상
+`scrape_interval=5s`인데 `rate(...[5s])`처럼 너무 짧게 잡으면 구간 안에 데이터포인트가 1개뿐이라 `rate`가 비거나 튑니다.
+**경험칙: range ≥ scrape_interval × 4** (여기선 `[1m]` 사용 → 5s×12포인트).
+
+### 6-3. Histogram의 p95는 `_bucket` + `le`로 계산
+지연시간 히스토그램은 `_bucket{le=...}`, `_sum`, `_count` 세 시리즈로 저장됩니다.
+분위수는 반드시 `le` 라벨을 살려서 집계:
+```promql
+histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+```
+`sum by (le)`를 빼먹으면 결과가 깨집니다. 정밀도는 미들웨어의 `buckets` 경계에 좌우됩니다.
+
+### 6-4. instant query vs range query
+- `/api/v1/query` (instant): 특정 시점의 값 1개 → 표/현재값 확인용
+- `/api/v1/query_range` (range): 시간축 그래프 → vmui 그래프 탭이 이걸 씀
+- vmui에서 데이터가 "안 보이면" 대부분 **우측 시간범위**가 데이터 밖이라서임 → `Last 15 minutes`로 조정
+
+### 6-5. 라벨 카디널리티 주의
+`route` 라벨에 `/api/products/123`처럼 **ID가 그대로 들어가면** 시리즈가 폭발합니다.
+반드시 파라미터화된 경로(`/api/products/:id`)로 정규화하세요. (본 PoC의 알려진 관찰점 참고)
+
+---
+
+## 7. VictoriaMetrics vs Prometheus — 차이점
+
+이 PoC는 "Prometheus 생태계(prom-client, PromQL, `/metrics`)"를 그대로 쓰되 **저장·쿼리 엔진만 VictoriaMetrics**로 바꾼 구조입니다. 핵심 차이를 정리합니다.
+
+### 7-1. 수집 모델 — Prometheus 서버가 없다
+| | Prometheus | 본 PoC(VictoriaMetrics) |
+|---|---|---|
+| 스크레이프 | Prometheus 서버가 직접 | **vmagent**가 스크레이프 |
+| 저장 | Prometheus 로컬 TSDB | VictoriaMetrics(단일 바이너리) |
+| 전송 | (자체 저장) | vmagent → `remote_write` → VM |
+
+> 즉 Prometheus 서버 없이 `vmagent + VictoriaMetrics` 조합으로 대체합니다. `/metrics` 노출과 scrape config 문법은 **Prometheus와 100% 호환**이라 앱 계측 코드는 그대로 재사용됩니다.
+
+### 7-2. 쿼리 언어 — PromQL ⊂ MetricsQL
+VictoriaMetrics는 **MetricsQL**을 씁니다. PromQL의 상위 호환이라 기존 PromQL은 그대로 동작하고, 편의 기능이 추가됩니다:
+- `rate(m)` 처럼 **구간 생략 가능**(기본 구간 자동), `range_*`, `histogram_quantile`의 개선판 등
+- `WITH` 템플릿, `keep_metric_names`, 더 관대한 파싱
+
+### 7-3. 저장/성능
+- VictoriaMetrics는 **압축률·메모리 효율이 높고** 단일 바이너리로 운영이 단순 (Step 1처럼 systemd 하나면 끝)
+- 높은 카디널리티/장기 보존에 상대적으로 유리, `-retentionPeriod`로 간단히 보존기간 설정
+
+### 7-4. 호환 엔드포인트
+- 쓰기: Prometheus `remote_write`, Influx, Graphite, OpenTSDB 등 다중 프로토콜 수용
+- 읽기: Prometheus HTTP API(`/api/v1/query`, `/query_range`) 호환 → **Grafana에서 Prometheus 데이터소스로 그대로 연결 가능**
+
+> 요약: **계측·수집 표준(Prometheus)은 유지**하고, **TSDB만 VictoriaMetrics로 교체**해 운영 단순성과 효율을 얻는 구성입니다.
 
 ---
 
