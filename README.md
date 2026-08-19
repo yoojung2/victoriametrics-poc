@@ -13,6 +13,7 @@ Azure 환경에서 **VictoriaMetrics**를 설치하고, 실제 애플리케이�
 | **쿼리 가이드** | VM·AKS 부하 기반 실전 운영 쿼리 (RED/USE, MetricsQL, 알람 예시) | [docs/query-guide.md](docs/query-guide.md) |
 | **카디널리티** | 카디널리티 개념·폭발 원인·진단 쿼리 (실측 기반) | [docs/cardinality.md](docs/cardinality.md) |
 | **확장/HA** | vmsingle vs vmcluster, scale-up/out·복제 판단 | [docs/scaling.md](docs/scaling.md) |
+| **VictoriaTraces vs Tempo** | 트레이싱 백엔드 비교 + PoC 아키텍처(공식문서 기반) | [docs/vs-tempo.md](docs/vs-tempo.md) |
 
 ## 아키텍처
 
